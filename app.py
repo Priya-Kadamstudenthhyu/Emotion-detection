@@ -1,219 +1,278 @@
+
+import time
+import webbrowser
+from collections import Counter, deque
+
 import cv2
 import numpy as np
-from deepface import DeepFace
-import webbrowser
-import time
-import threading
-import random
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 import pandas as pd
 import streamlit as st
+from deepface import DeepFace
 
-# YouTube links for different emotions
-emotion_songs = {
-    "happy": "https://www.youtube.com/shorts/lZEd0KKPS_U",
-    "sad": "https://www.youtube.com/shorts/pu9G7-sXWqw",
-    "angry": "https://www.youtube.com/shorts/yUvqLDBX51Q",
-    "surprise": "https://www.youtube.com/shorts/zyxIit_Zk0k",
-    "neutral": "https://www.youtube.com/shorts/qWzBnwwBtOY",
-    "fear": "https://www.youtube.com/shorts/C09gs-uD7a0",
-    "disgust": "https://www.youtube.com/shorts/C09gs-uD7a0"
+
+SONG_LINKS = {
+    "happy": "https://www.youtube.com/results?search_query=happy+feel+good+songs",
+    "sad": "https://www.youtube.com/results?search_query=calm+comforting+songs",
+    "angry": "https://www.youtube.com/results?search_query=relaxing+stress+relief+music",
+    "surprise": "https://www.youtube.com/results?search_query=upbeat+surprise+playlist",
+    "neutral": "https://www.youtube.com/results?search_query=lofi+focus+music",
+    "fear": "https://www.youtube.com/results?search_query=calming+peaceful+music",
+    "disgust": "https://www.youtube.com/results?search_query=positive+refreshing+music",
 }
 
-# Streamlit layout
-st.set_page_config(page_title="Real-Time Emotion Music System", layout="wide")
-st.title("🎭 Real-Time Emotion Detection + Music Player")
+CHAT_MESSAGES = {
+    "happy": "You look happy. I am suggesting an energetic playlist.",
+    "sad": "You look a little sad. I am suggesting calm music.",
+    "angry": "You look stressed or angry. I am suggesting relaxing music.",
+    "surprise": "You look surprised. I am suggesting upbeat music.",
+    "neutral": "You look neutral. I am suggesting focus music.",
+    "fear": "You look worried. I am suggesting peaceful music.",
+    "disgust": "You look uncomfortable. I am suggesting refreshing music.",
+}
 
-frame_placeholder = st.empty()
-chatbot_placeholder = st.empty()
+EMOTION_ORDER = ["happy", "sad", "angry", "surprise", "neutral", "fear", "disgust"]
+PREVIEW_WIDTH = 760
 
-# Globals
-is_song_playing = False
-current_emotion = None
-last_message_time = time.time()
-detected_emotions = []
-true_emotions = []
-confidence_scores = []
-emotions_over_time = {e: [] for e in emotion_songs}
 
-# Music player
-def play_song(emotion):
-    global is_song_playing
-    if not is_song_playing:
-        is_song_playing = True
-        webbrowser.open(emotion_songs[emotion])
-        time.sleep(35)
-        is_song_playing = False
+def normalize_deepface_result(result):
+    """DeepFace may return either a dict or a list depending on version."""
+    if isinstance(result, list):
+        result = result[0]
+    emotions = result.get("emotion", {})
+    dominant = result.get("dominant_emotion") or max(emotions, key=emotions.get)
+    confidence = float(emotions.get(dominant, 0.0))
+    return dominant, confidence, emotions
 
-# Start webcam
-cap = cv2.VideoCapture(0)
 
-if not cap.isOpened():
-    st.error("❌ Cannot access camera.")
-else:
-    chatbot_text = ""
+def resize_for_preview(frame, width=PREVIEW_WIDTH):
+    height, current_width = frame.shape[:2]
+    if current_width <= width:
+        return frame
+
+    ratio = width / current_width
+    new_height = int(height * ratio)
+    return cv2.resize(frame, (width, new_height), interpolation=cv2.INTER_AREA)
+
+
+def draw_overlay(frame, stable_emotion, confidence, emotions):
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (frame.shape[1], 92), (20, 20, 20), -1)
+    frame = cv2.addWeighted(overlay, 0.65, frame, 0.35, 0)
+
+    title = f"Mood: {stable_emotion.upper()}  |  Confidence: {confidence:.1f}%"
+    cv2.putText(frame, title, (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    x = 14
+    y = 58
+    for emotion in EMOTION_ORDER:
+        score = int(emotions.get(emotion, 0))
+        color = (95, 220, 95) if emotion == stable_emotion else (170, 170, 170)
+        cv2.putText(frame, f"{emotion}: {score}%", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        x += 105
+        if x > frame.shape[1] - 120:
+            x = 14
+            y += 22
+    return frame
+
+
+def recommendation_for(emotion):
+    return {
+        "emotion": emotion,
+        "message": CHAT_MESSAGES.get(emotion, "I found your mood and selected music for you."),
+        "song": SONG_LINKS.get(emotion, SONG_LINKS["neutral"]),
+    }
+
+
+def run_demo(duration, analysis_gap, smoothing_window, auto_open_music, music_cooldown):
+    frame_box = st.empty()
+    status_box = st.empty()
+    recommendation_box = st.empty()
+    progress_bar = st.progress(0)
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        st.error("Camera not found. Please check webcam permission and try again.")
+        return pd.DataFrame()
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    history = []
+    recent_predictions = deque(maxlen=smoothing_window)
+    last_analysis = 0.0
+    last_music_open = 0.0
+    current_recommendation = None
+    last_emotions = {emotion: 0.0 for emotion in EMOTION_ORDER}
     start_time = time.time()
+    frame_number = 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            st.error("❌ Webcam error.")
-            break
+    try:
+        while time.time() - start_time <= duration:
+            ok, frame = cap.read()
+            if not ok:
+                st.warning("Could not read frame from webcam.")
+                break
 
-        frame = cv2.flip(frame, 1)
+            frame_number += 1
+            frame = cv2.flip(frame, 1)
+            now = time.time()
 
-        try:
-            result = DeepFace.analyze(frame, actions=["emotion"], enforce_detection=False)
-            emotions = result[0]['emotion']
-            dominant_emotion = max(emotions, key=emotions.get)
-            confidence = emotions[dominant_emotion]
+            if now - last_analysis >= analysis_gap:
+                last_analysis = now
+                try:
+                    result = DeepFace.analyze(
+                        frame,
+                        actions=["emotion"],
+                        enforce_detection=False,
+                        silent=True,
+                    )
+                    predicted, confidence, emotions = normalize_deepface_result(result)
+                    recent_predictions.append(predicted)
+                    stable_emotion = Counter(recent_predictions).most_common(1)[0][0]
+                    last_emotions = {emotion: float(emotions.get(emotion, 0.0)) for emotion in EMOTION_ORDER}
 
-            detected_emotions.append(dominant_emotion)
-            true_emotions.append(dominant_emotion)
-            confidence_scores.append(confidence)
+                    rec = recommendation_for(stable_emotion)
+                    if current_recommendation != stable_emotion:
+                        current_recommendation = stable_emotion
+                        recommendation_box.info(f"{rec['message']}  Link: {rec['song']}")
 
-            for em in emotion_songs:
-                emotions_over_time[em].append(emotions.get(em, 0))
+                    if auto_open_music and now - last_music_open >= music_cooldown:
+                        webbrowser.open(rec["song"])
+                        last_music_open = now
 
-            if time.time() - last_message_time > 5:
-                chatbot_text = f"You seem {dominant_emotion}. Here's something for you!"
-                chatbot_placeholder.markdown(f"### 🤖 Chatbot: {chatbot_text}")
-                last_message_time = time.time()
+                    history.append(
+                        {
+                            "time_seconds": round(now - start_time, 2),
+                            "frame": frame_number,
+                            "predicted_emotion": predicted,
+                            "stable_emotion": stable_emotion,
+                            "confidence_percent": round(confidence, 2),
+                            **{f"{emotion}_score": round(last_emotions[emotion], 2) for emotion in EMOTION_ORDER},
+                        }
+                    )
+                except Exception as exc:
+                    status_box.warning(f"Emotion detection skipped for this frame: {exc}")
 
-            # Display text on frame
-            y = 30
-            for emo, score in emotions.items():
-                cv2.putText(frame, f"{emo.capitalize()}: {int(score)}%", (10, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                            (0, 255, 0) if emo == dominant_emotion else (255, 255, 255), 2)
-                y += 25
+            stable = history[-1]["stable_emotion"] if history else "detecting"
+            conf = history[-1]["confidence_percent"] if history else 0.0
+            frame = resize_for_preview(frame)
+            frame = draw_overlay(frame, stable, conf, last_emotions)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_box.image(frame_rgb, channels="RGB", width=PREVIEW_WIDTH)
 
-            if not is_song_playing and current_emotion != dominant_emotion:
-                current_emotion = dominant_emotion
-                threading.Thread(target=play_song, args=(current_emotion,), daemon=True).start()
+            elapsed = time.time() - start_time
+            progress_bar.progress(min(1.0, elapsed / duration))
+            status_box.caption(f"Analyzing webcam... {int(max(0, duration - elapsed))} seconds left")
+            time.sleep(0.03)
+    finally:
+        cap.release()
 
-            _, buffer = cv2.imencode('.jpg', frame)
-            frame_placeholder.image(buffer.tobytes(), channels="BGR")
-
-        except Exception as e:
-            st.warning(f"⚠ Detection Error: {e}")
-
-        if time.time() - start_time > 45:
-            break
-
-        time.sleep(0.1)
-
-    cap.release()
-
-# ================== RESULTS ==================
-if len(true_emotions) > 0:
-    st.subheader("📊 Emotion Detection Results")
-
-    accuracy = accuracy_score(true_emotions, detected_emotions)
-    precision = precision_score(true_emotions, detected_emotions, average='weighted')
-    recall = recall_score(true_emotions, detected_emotions, average='weighted')
-    f1 = f1_score(true_emotions, detected_emotions, average='weighted')
-
-    st.write(f"✅ *Accuracy*: {accuracy*100:.2f}%")
-    st.write(f"✅ *Precision*: {precision:.2f}")
-    st.write(f"✅ *Recall*: {recall:.2f}")
-    st.write(f"✅ *F1-Score*: {f1:.2f}")
-
-    emotions_list = list(emotion_songs.keys())
-    cm = confusion_matrix(true_emotions, detected_emotions, labels=emotions_list)
-
-    # ========== Graphs in 2 Columns ==========
-    col1, col2 = st.columns(2)
-
-    with col1:
-        fig1, ax1 = plt.subplots(figsize=(4, 3))
-        sns.heatmap(cm, annot=True, cmap="Blues", xticklabels=emotions_list, yticklabels=emotions_list, fmt="d", ax=ax1, cbar=False)
-        ax1.set_title("Confusion Matrix", fontsize=10)
-        ax1.set_xlabel("Predicted", fontsize=8)
-        ax1.set_ylabel("True", fontsize=8)
-        st.pyplot(fig1)
-
-    with col2:
-        fig2, ax2 = plt.subplots(figsize=(4, 3))
-        sns.countplot(x=detected_emotions, order=emotions_list, palette="Set2", ax=ax2)
-        ax2.set_title("Detected Emotion Count", fontsize=10)
-        ax2.tick_params(axis='x', labelsize=8)
-        st.pyplot(fig2)
-
-    col3, col4 = st.columns(2)
-
-    with col3:
-        emotion_counts = {emotion: detected_emotions.count(emotion) for emotion in emotions_list}
-        fig3, ax3 = plt.subplots(figsize=(4, 3))
-        ax3.pie(emotion_counts.values(), labels=emotion_counts.keys(), autopct='%1.1f%%',
-               startangle=140, colors=sns.color_palette("Set2"), textprops={'fontsize': 8})
-        ax3.set_title("Emotion Distribution", fontsize=10)
-        st.pyplot(fig3)
-
-    with col4:
-        fig4, ax4 = plt.subplots(figsize=(4, 3))
-        ax4.plot(confidence_scores, marker='o', linestyle='-', color='purple')
-        ax4.set_title("Confidence Over Time", fontsize=10)
-        ax4.set_xlabel("Frame", fontsize=8)
-        ax4.set_ylabel("Confidence (%)", fontsize=8)
-        ax4.tick_params(labelsize=7)
-        st.pyplot(fig4)
-
-    # Full width for heatmap
-    st.markdown("### 🔥 Emotion Intensity Over Time")
-    df_emotions = pd.DataFrame(emotions_over_time)
-    fig5, ax5 = plt.subplots(figsize=(8, 3))
-    sns.heatmap(df_emotions.T, cmap="YlGnBu", cbar_kws={'label': 'Intensity (%)'}, ax=ax5)
-    ax5.set_title("Emotion Intensity Over Time", fontsize=10)
-    ax5.set_xlabel("Frame", fontsize=8)
-    ax5.set_ylabel("Emotion", fontsize=8)
-    ax5.tick_params(labelsize=7)
-    st.pyplot(fig5)
-
-else:
-    st.warning("⚠ No emotion data to display.")
-
-# ================== SAVE & DOWNLOAD SECTION ==================
-st.markdown("---")
-st.subheader("💾 Save Results & Download Report")
-
-result_data = pd.DataFrame({
-    "True Emotion": true_emotions,
-    "Predicted Emotion": detected_emotions,
-    "Confidence": confidence_scores
-})
-
-csv_data = result_data.to_csv(index=False)
-st.download_button(
-    label="📄 Download Detected Emotions (CSV)",
-    data=csv_data,
-    file_name="emotion_detection_results.csv",
-    mime="text/csv"
-)
-
-summary = f"""
-📊 Emotion Detection Summary Report
-
-Total Frames Analyzed: {len(true_emotions)}
-Accuracy: {accuracy*100:.2f}%
-Precision: {precision:.2f}
-Recall: {recall:.2f}
-F1-Score: {f1:.2f}
-
-Top 3 Detected Emotions:
-"""
-for emo, count in sorted(emotion_counts.items(), key=lambda x: x[1], reverse=True)[:3]:
-    summary += f"\n- {emo.capitalize()}: {count} times"
-
-summary += "\n\nThank you for using the Emotion Detection Music System! 🎧"
-
-st.download_button(
-    label="📝 Download Summary Report (TXT)",
-    data=summary,
-    file_name="emotion_summary_report.txt",
-    mime="text/plain"
-)
+    return pd.DataFrame(history)
 
 
+def show_results(results):
+    if results.empty:
+        st.warning("No emotion data was captured.")
+        return
+
+    st.subheader("Demo Results")
+
+    top_emotion = results["stable_emotion"].mode().iloc[0]
+    average_confidence = results["confidence_percent"].mean()
+    stability = (results["stable_emotion"] == top_emotion).mean() * 100
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Most detected mood", top_emotion.title())
+    col2.metric("Average confidence", f"{average_confidence:.1f}%")
+    col3.metric("Prediction stability", f"{stability:.1f}%")
+
+    st.info(
+        "Note: This live demo does not calculate real accuracy because there is no manually labelled ground truth. "
+        "For an interview, explain confidence and stability here, and say that real accuracy needs a labelled test dataset."
+    )
+
+    counts = results["stable_emotion"].value_counts().reindex(EMOTION_ORDER, fill_value=0)
+    st.bar_chart(counts)
+
+    st.line_chart(results.set_index("time_seconds")["confidence_percent"])
+
+    st.download_button(
+        "Download CSV report",
+        data=results.to_csv(index=False),
+        file_name="emotion_music_demo_report.csv",
+        mime="text/csv",
+    )
+
+    summary = (
+        "Emotion Music Recommendation System - Demo Summary\n\n"
+        f"Total analyzed frames: {len(results)}\n"
+        f"Most detected mood: {top_emotion}\n"
+        f"Average confidence: {average_confidence:.2f}%\n"
+        f"Prediction stability: {stability:.2f}%\n\n"
+        "Project idea: Detect the user's facial emotion from webcam video and recommend music "
+        "that matches or improves the user's mood.\n"
+    )
+    st.download_button(
+        "Download text summary",
+        data=summary,
+        file_name="emotion_music_summary.txt",
+        mime="text/plain",
+    )
+
+
+def main():
+    st.set_page_config(page_title="Emotion Music Recommender", layout="wide")
+
+    st.title("Real-Time Emotion Based Music Recommender")
+    st.caption("Webcam emotion detection using DeepFace, OpenCV, and Streamlit.")
+
+    with st.sidebar:
+        st.header("Demo Settings")
+        duration = st.slider("Demo duration", 15, 90, 45, step=5)
+        analysis_gap = st.slider("Analyze every seconds", 0.5, 3.0, 1.0, step=0.5)
+        smoothing_window = st.slider("Smoothing window", 1, 7, 3, step=1)
+        auto_open_music = st.checkbox("Automatically open music link", value=False)
+        music_cooldown = st.slider("Music cooldown seconds", 10, 120, 35, step=5)
+
+    intro_left, intro_right = st.columns([1.2, 0.8])
+    with intro_left:
+        st.markdown(
+            """
+            This project detects a face emotion from the webcam and recommends a playlist.
+            It is designed for a short interview demo: start the camera, show the live mood,
+            explain the recommendation, and download the report.
+            """
+        )
+    with intro_right:
+        st.markdown(
+            """
+            **Pipeline:** Camera -> OpenCV frame -> DeepFace emotion model -> smoothing ->
+            music recommendation -> report.
+            """
+        )
+
+    start = st.button("Start live demo", type="primary")
+    if start:
+        results = run_demo(duration, analysis_gap, smoothing_window, auto_open_music, music_cooldown)
+        show_results(results)
+    else:
+        st.subheader("What this app can detect")
+        preview = pd.DataFrame(
+            {
+                "emotion": EMOTION_ORDER,
+                "recommendation_type": [
+                    "energetic",
+                    "calming",
+                    "relaxing",
+                    "upbeat",
+                    "focus",
+                    "peaceful",
+                    "refreshing",
+                ],
+            }
+        )
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+
+
+if __name__ == "__main__":
+    main()
